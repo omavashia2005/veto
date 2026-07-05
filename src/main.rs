@@ -4,8 +4,11 @@ use  veto_graph::*;
 fn main() {
     println!("Printing something...");
     let path: String =  String::from("/Users/omavashia/hydra/.git");
-    let raw_commits =  get_commits_from_repo(path);
+    let raw_commits =  get_commits_from_repo(path); 
 
-    
-    veto_graph::CommitGraph::build(raw_commits);
+    // build the graph
+    let nodes = CommitGraph::build(&raw_commits);
+
+    // connect edges
+    CommitGraph::connect_edges(&nodes, &raw_commits);
 }
