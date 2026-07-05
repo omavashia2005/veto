@@ -1,0 +1,7 @@
+[package]
+name = "veto-graph"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+veto-git = { version = "0.1.0", path = "../veto-git" }
