@@ -4,10 +4,10 @@ use git2::*;
 
 #[derive(Debug)]
 pub struct RawCommit {
-    parent_hashes: Vec<String>,
-    author: String,
-    timestamp: u64,
-    message: String,
+    pub parent_hashes: Vec<String>,
+    pub author: String,
+    pub timestamp: u64,
+    pub message: String,
 }
 
 
