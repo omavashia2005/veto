@@ -42,7 +42,6 @@ impl CommitGraph {
 
     //  In the second pass, we walk through every node and 
     //  wire up its parent and child edges using Weak references
-
     pub fn connect_edges(
         nodes: &HashMap<String, Rc<RefCell<CommitNode>>>, 
         raw_commits:  &HashMap<String, RawCommit>,
