@@ -2,6 +2,7 @@ use veto_git::RawCommit;
 use std::cell::RefCell;
 use std::collections::{HashMap};
 use std::rc::{Rc, Weak};
+use std::thread::current;
 
 
 pub struct CommitNode{
@@ -64,6 +65,34 @@ impl CommitGraph {
 
             }
         }
+    }
+
+
+    pub fn walk_graph(
+        nodes: &HashMap<String, Rc<RefCell<CommitNode>>>, 
+        start_hash: &str,
+        ) {
+
+        let mut path = Vec::new();
+        let mut current_hash = start_hash.to_string();
+
+        loop{
+            if  let Some(node) = nodes.get(&current_hash){
+                let cur = node.borrow();
+                path.push(current_hash.clone());
+
+                match cur.parents.borrow().first(){
+                    Some(first_parent) => match first_parent.upgrade(){
+                        Some(parent) => current_hash = parent.borrow().hash.clone(), 
+                        None => break,
+                    }, 
+                    None => break,
+                }
+            } else {
+               break; 
+            }
+        }
+
     }
 
 }
