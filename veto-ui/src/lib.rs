@@ -79,6 +79,7 @@ struct App<'a> {
     branches: &'a [(String, String)],     // (name, tip hash)
     sel: usize,                           // index into cells
     popup: bool,
+    menu: Option<usize>, // branch dropdown: highlighted index when open
     tick: usize,
     zoom: usize, // index into ZOOM
     yaw: f64,
@@ -103,6 +104,7 @@ pub fn run(nodes: &Nodes, branches: &[(String, String)]) -> io::Result<()> {
         branches,
         sel: 0, // cells sorted by row asc, so index 0 is a row-0 (newest) cell
         popup: false,
+        menu: None,
         tick: 0,
         zoom: 2,
         yaw: 0.35, // start slightly tilted so the depth reads immediately
@@ -124,14 +126,18 @@ pub fn run(nodes: &Nodes, branches: &[(String, String)]) -> io::Result<()> {
                 }
                 app.idle = 0;
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('q') => break,
+                    KeyCode::Esc if app.menu.is_some() => app.menu = None,
+                    KeyCode::Esc => break,
+                    _ if app.menu.is_some() => app.menu_key(key.code),
                     KeyCode::Char('i') => app.popup = !app.popup,
                     _ if app.popup => app.popup = false, // any key closes the popup
                     KeyCode::Char('h') => app.move_kin(true), // left = older = parent
                     KeyCode::Char('l') => app.move_kin(false), // right = newer = child
                     KeyCode::Char('j') => app.move_lateral(1),
                     KeyCode::Char('k') => app.move_lateral(-1),
-                    KeyCode::Char('b') => app.next_branch(),
+                    KeyCode::Char('b') if !app.branches.is_empty() => app.menu = Some(0),
+                    KeyCode::Char('m') => app.go_home(),
                     KeyCode::Left => app.yaw -= 0.15,
                     KeyCode::Right => app.yaw += 0.15,
                     KeyCode::Up => app.pitch = (app.pitch + 0.1).min(1.4),
@@ -192,22 +198,35 @@ impl App<'_> {
         }
     }
 
-    /// b: jump to the next branch tip (wraps around).
-    fn next_branch(&mut self) {
-        if self.branches.is_empty() {
-            return;
+    /// Keys while the branch dropdown is open: j/k or arrows move, Enter jumps
+    /// to the branch tip, b closes.
+    fn menu_key(&mut self, code: KeyCode) {
+        let Some(i) = self.menu else { return };
+        let n = self.branches.len();
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => self.menu = Some((i + 1) % n),
+            KeyCode::Char('k') | KeyCode::Up => self.menu = Some((i + n - 1) % n),
+            KeyCode::Enter => {
+                let hash = self.branches[i].1.clone();
+                self.select_hash(&hash);
+                self.menu = None;
+            }
+            KeyCode::Char('b') => self.menu = None,
+            _ => {}
         }
-        let cur = self.sel_cell().map(|c| c.hash.clone());
-        let next = match self
+    }
+
+    /// m: return to the tip of main (or master, or the first branch).
+    fn go_home(&mut self) {
+        let tip = self
             .branches
             .iter()
-            .position(|(_, tip)| Some(tip) == cur.as_ref())
-        {
-            Some(i) => (i + 1) % self.branches.len(),
-            None => 0,
-        };
-        let hash = self.branches[next].1.clone();
-        self.select_hash(&hash);
+            .find(|(name, _)| name == "main" || name == "master")
+            .or_else(|| self.branches.first())
+            .map(|(_, tip)| tip.clone());
+        if let Some(tip) = tip {
+            self.select_hash(&tip);
+        }
     }
 
     /// j/k: prefer a parent/child on a lane in that direction (lets you pick
@@ -298,7 +317,7 @@ impl App<'_> {
         self.draw_graph(f, graph);
 
         f.render_widget(
-            Paragraph::new(" h/l parent/child  j/k lanes  b branch  ←↑↓→ rotate  +/- zoom  i info  q quit")
+            Paragraph::new(" h/l parent/child  j/k lanes  b branches  m main  ←↑↓→ rotate  +/- zoom  i info  q quit")
                 .style(Style::new().fg(Color::DarkGray)),
             hints,
         );
@@ -306,6 +325,42 @@ impl App<'_> {
         if self.popup {
             self.draw_popup(f);
         }
+        if self.menu.is_some() {
+            self.draw_menu(f);
+        }
+    }
+
+    /// Branch dropdown, anchored top-left under the status bar.
+    fn draw_menu(&self, f: &mut ratatui::Frame) {
+        let Some(sel) = self.menu else { return };
+        let lines: Vec<Line> = self
+            .branches
+            .iter()
+            .enumerate()
+            .map(|(i, (name, tip))| {
+                let short: String = tip.chars().take(7).collect();
+                let text = format!(" {name}  {short} ");
+                if i == sel {
+                    Line::styled(text, Style::new().fg(Color::Black).bg(Color::Cyan))
+                } else {
+                    Line::styled(text, Style::new().fg(Color::Gray))
+                }
+            })
+            .collect();
+        let area = f.area();
+        let w = (lines.iter().map(|l| l.width()).max().unwrap_or(10) as u16 + 2)
+            .min(area.width.saturating_sub(2));
+        let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+        let rect = Rect::new(area.x + 1, area.y + 2, w, h);
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(lines).block(
+                Block::bordered()
+                    .title(" ⎇ branches ")
+                    .border_style(Style::new().fg(Color::LightMagenta)),
+            ),
+            rect,
+        );
     }
 
     fn draw_graph(&self, f: &mut ratatui::Frame, area: Rect) {
@@ -317,7 +372,7 @@ impl App<'_> {
         let canvas = Canvas::default()
             .x_bounds([-radius, radius])
             .y_bounds([-yr, yr])
-            .marker(Marker::Braille)
+            .marker(Marker::HalfBlock) // solid links, not braille dots
             .paint(|ctx| {
                 // starfield drifting opposite the rotation for parallax
                 for i in 0..80u64 {
