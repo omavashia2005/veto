@@ -1,4 +1,4 @@
-use std::{collections::HashMap, panic};
+use std::collections::HashMap;
 
 use git2::*;
 
@@ -11,14 +11,15 @@ pub struct RawCommit {
 }
 
 
-fn walk_main(repo: &Repository, head_name: &str) -> HashMap<String, RawCommit>{ 
+fn walk_all_branches(repo: &Repository) -> HashMap<String, RawCommit>{
     let mut commit_map : HashMap<String, RawCommit> = HashMap::new();
     let mut w = match repo.revwalk(){
-        Ok(w) => w, 
-        Err(e) =>  panic!("Failure resolving head ref name: {}", e)
+        Ok(w) => w,
+        Err(e) =>  panic!("Failure creating revwalk: {}", e)
     };
-    
-    let _ = w.push_ref(head_name);
+
+    let _ = w.push_glob("refs/heads/*"); // every local branch
+    let _ = w.push_head(); // detached HEAD commits not on any branch
 
     for commit_id in w{
 
@@ -52,19 +53,9 @@ fn walk_main(repo: &Repository, head_name: &str) -> HashMap<String, RawCommit>{
 
 pub fn  get_commits_from_repo(path: String) -> HashMap<String, RawCommit>{ 
     let repo = match  Repository::open(&path){
-        Ok(repo) => repo , 
+        Ok(repo) => repo ,
         Err(e)  => panic!("failed to open: {}" , e)
     };
 
-    let repo_head: Reference =  match repo.head(){
-        Ok(repo_head) => repo_head,
-        Err(e) => panic!("Error resolving head: {}", e)
-    };
-
-    let head_name =  match repo_head.name(){
-        Ok(head_name) => head_name, 
-        Err(e) =>  panic!("Error reading head name :{}", e)
-    };
-
-    walk_main(&repo, head_name)
+    walk_all_branches(&repo)
 }
