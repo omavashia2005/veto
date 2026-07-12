@@ -1,14 +1,10 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+use std::{cell::RefCell, collections::HashMap, io, rc::Rc};
+use veto_graph::CommitNode;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod layout;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+/// Take over the terminal and run the interactive commit-graph explorer.
+/// h/l/j/k traverse the graph, i shows node metadata, q quits.
+pub fn run(_nodes: &HashMap<String, Rc<RefCell<CommitNode>>>) -> io::Result<()> {
+    Ok(()) // ponytail: stub, implemented in tui pass
 }

@@ -2,7 +2,6 @@ use veto_git::RawCommit;
 use std::cell::RefCell;
 use std::collections::{HashMap};
 use std::rc::{Rc, Weak};
-use std::thread::current;
 
 
 pub struct CommitNode{
