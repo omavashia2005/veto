@@ -11,9 +11,10 @@ fn main() {
         s.trim().to_string()
     });
 
+    let branches = veto_git::get_branches(path.clone());
     let raw_commits = get_commits_from_repo(path);
     let nodes = CommitGraph::build(&raw_commits);
     CommitGraph::connect_edges(&nodes, &raw_commits);
 
-    veto_ui::run(&nodes).unwrap();
+    veto_ui::run(&nodes, &branches).unwrap();
 }

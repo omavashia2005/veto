@@ -9,7 +9,6 @@ use std::{
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    buffer::Buffer,
     crossterm::{
         event::{self, Event, KeyCode, KeyEventKind},
         execute,
@@ -17,8 +16,12 @@ use ratatui::{
     },
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols::Marker,
     text::Line,
-    widgets::{Block, Clear, Paragraph, Wrap},
+    widgets::{
+        Block, Clear, Paragraph, Wrap,
+        canvas::{Canvas, Line as Line3},
+    },
 };
 use veto_graph::CommitNode;
 
@@ -27,8 +30,11 @@ use layout::Cell;
 
 type Nodes = HashMap<String, Rc<RefCell<CommitNode>>>;
 
-/// zoom levels: (column width, lane height, draw hash labels)
-const ZOOM: [(usize, usize, bool); 4] = [(3, 1, false), (6, 2, false), (12, 2, true), (18, 3, true)];
+/// zoom levels: (view radius in world units, draw hash labels)
+const ZOOM: [(f64, bool); 4] = [(90.0, false), (45.0, false), (22.0, true), (12.0, true)];
+const SPACING_T: f64 = 6.0; // world units per commit along the time axis
+const SPACING_L: f64 = 4.0; // per lane
+const FOCAL: f64 = 60.0; // perspective focal length
 const LANE_COLORS: [Color; 6] = [
     Color::Cyan,
     Color::Magenta,
@@ -41,6 +47,19 @@ const PULSE: [Color; 4] = [Color::White, Color::LightYellow, Color::Yellow, Colo
 
 fn lane_color(lane: usize) -> Color {
     LANE_COLORS[lane % LANE_COLORS.len()]
+}
+
+/// Stable per-hash depth so the constellation isn't a flat sheet.
+fn jitter(hash: &str) -> f64 {
+    let h = hash
+        .bytes()
+        .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64));
+    (h % 9) as f64 - 4.0
+}
+
+/// Rotate (a, b) by ang radians.
+fn rot(a: f64, b: f64, ang: f64) -> (f64, f64) {
+    (a * ang.cos() - b * ang.sin(), a * ang.sin() + b * ang.cos())
 }
 
 /// Restores the terminal on drop (including on panic unwind).
@@ -57,17 +76,21 @@ struct App<'a> {
     nodes: &'a Nodes,
     cells: Vec<Cell>,
     pos: HashMap<String, (usize, usize)>, // hash -> (lane, row)
+    branches: &'a [(String, String)],     // (name, tip hash)
     sel: usize,                           // index into cells
-    scroll: (usize, usize),               // (x, y) in world chars
     popup: bool,
     tick: usize,
     zoom: usize, // index into ZOOM
+    yaw: f64,
+    pitch: f64,
+    idle: usize, // ticks since last keypress, drives the screensaver spin
 }
 
-/// Take over the terminal and run the interactive commit-graph explorer.
+/// Take over the terminal and run the interactive 3D commit-graph explorer.
 /// Time flows left (old) to right (new): h/l walk parent/child, j/k move
-/// across lanes, +/- zoom, i shows metadata, q quits.
-pub fn run(nodes: &Nodes) -> io::Result<()> {
+/// across lanes, b jumps between branch tips, arrows rotate the view,
+/// +/- zoom, i shows metadata, q quits.
+pub fn run(nodes: &Nodes, branches: &[(String, String)]) -> io::Result<()> {
     let cells = layout::layout(nodes);
     let pos = cells
         .iter()
@@ -77,11 +100,14 @@ pub fn run(nodes: &Nodes) -> io::Result<()> {
         nodes,
         cells,
         pos,
+        branches,
         sel: 0, // cells sorted by row asc, so index 0 is a row-0 (newest) cell
-        scroll: (0, 0),
         popup: false,
         tick: 0,
         zoom: 2,
+        yaw: 0.35, // start slightly tilted so the depth reads immediately
+        pitch: 0.25,
+        idle: 0,
     };
 
     enable_raw_mode()?;
@@ -96,6 +122,7 @@ pub fn run(nodes: &Nodes) -> io::Result<()> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                app.idle = 0;
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('i') => app.popup = !app.popup,
@@ -104,6 +131,11 @@ pub fn run(nodes: &Nodes) -> io::Result<()> {
                     KeyCode::Char('l') => app.move_kin(false), // right = newer = child
                     KeyCode::Char('j') => app.move_lateral(1),
                     KeyCode::Char('k') => app.move_lateral(-1),
+                    KeyCode::Char('b') => app.next_branch(),
+                    KeyCode::Left => app.yaw -= 0.15,
+                    KeyCode::Right => app.yaw += 0.15,
+                    KeyCode::Up => app.pitch = (app.pitch + 0.1).min(1.4),
+                    KeyCode::Down => app.pitch = (app.pitch - 0.1).max(-1.4),
                     KeyCode::Char('+') | KeyCode::Char('=') => {
                         app.zoom = (app.zoom + 1).min(ZOOM.len() - 1)
                     }
@@ -113,6 +145,10 @@ pub fn run(nodes: &Nodes) -> io::Result<()> {
             }
         } else {
             app.tick = app.tick.wrapping_add(1);
+            app.idle += 1;
+            if app.idle > 50 {
+                app.yaw += 0.01; // idle screensaver: slow orbit
+            }
         }
     }
     Ok(())
@@ -121,6 +157,14 @@ pub fn run(nodes: &Nodes) -> io::Result<()> {
 impl App<'_> {
     fn sel_cell(&self) -> Option<&Cell> {
         self.cells.get(self.sel)
+    }
+
+    /// Branch name if the given hash is a branch tip.
+    fn branch_of(&self, hash: &str) -> Option<&str> {
+        self.branches
+            .iter()
+            .find(|(_, tip)| tip == hash)
+            .map(|(name, _)| name.as_str())
     }
 
     /// Hashes of parents (or children) of the selected node, via Weak upgrades.
@@ -141,18 +185,29 @@ impl App<'_> {
         }
     }
 
-    /// World coords: oldest commit at x=0, time flows rightward; lanes stack down.
-    fn world(&self, lane: usize, row: usize) -> (usize, usize) {
-        let (cw, lh, _) = ZOOM[self.zoom];
-        let max_row = self.cells.len().saturating_sub(1); // one commit per row
-        ((max_row - row) * cw, lane * lh)
-    }
-
     /// h (left = first parent, older) / l (right = first child, newer).
     fn move_kin(&mut self, parents: bool) {
         if let Some(h) = self.kin(parents).first().cloned() {
             self.select_hash(&h);
         }
+    }
+
+    /// b: jump to the next branch tip (wraps around).
+    fn next_branch(&mut self) {
+        if self.branches.is_empty() {
+            return;
+        }
+        let cur = self.sel_cell().map(|c| c.hash.clone());
+        let next = match self
+            .branches
+            .iter()
+            .position(|(_, tip)| Some(tip) == cur.as_ref())
+        {
+            Some(i) => (i + 1) % self.branches.len(),
+            None => 0,
+        };
+        let hash = self.branches[next].1.clone();
+        self.select_hash(&hash);
     }
 
     /// j/k: prefer a parent/child on a lane in that direction (lets you pick
@@ -177,6 +232,33 @@ impl App<'_> {
         }
     }
 
+    /// World position: x = time axis (right = newer), y = lane, z = hash depth.
+    fn world3(&self, lane: usize, row: usize, hash: &str) -> (f64, f64, f64) {
+        let max_row = self.cells.len().saturating_sub(1); // one commit per row
+        (
+            (max_row - row) as f64 * SPACING_T,
+            lane as f64 * SPACING_L,
+            jitter(hash),
+        )
+    }
+
+    /// Perspective-project into view space centered on the selection (which
+    /// therefore always sits at the middle of the screen and is the pivot the
+    /// view rotates around). Returns (screen x, screen y, depth).
+    fn project(&self, lane: usize, row: usize, hash: &str) -> (f64, f64, f64) {
+        let c = self
+            .sel_cell()
+            .map(|c| self.world3(c.lane, c.row, &c.hash))
+            .unwrap_or((0.0, 0.0, 0.0));
+        let w = self.world3(lane, row, hash);
+        let (mut x, mut y, mut z) = (w.0 - c.0, w.1 - c.1, w.2 - c.2);
+        (x, z) = rot(x, z, self.yaw);
+        (y, z) = rot(y, z, self.pitch);
+        // ponytail: clamp instead of culling points behind the camera
+        let s = FOCAL / (FOCAL + z).max(1.0);
+        (x * s, -y * s, z) // negate y: lane 0 renders at the top
+    }
+
     fn draw(&mut self, f: &mut ratatui::Frame) {
         let [title, status, graph, hints] = Layout::vertical([
             Constraint::Length(1),
@@ -196,8 +278,12 @@ impl App<'_> {
         let status_line = match self.sel_cell().and_then(|c| self.nodes.get(&c.hash)) {
             Some(n) => {
                 let n = n.borrow();
+                let branch = self
+                    .branch_of(&n.hash)
+                    .map(|b| format!(" [{b}]"))
+                    .unwrap_or_default();
                 format!(
-                    " {} — {}",
+                    " {}{branch} — {}",
                     n.short_hash,
                     n.message.lines().next().unwrap_or("")
                 )
@@ -209,10 +295,10 @@ impl App<'_> {
             status,
         );
 
-        self.draw_graph(f.buffer_mut(), graph);
+        self.draw_graph(f, graph);
 
         f.render_widget(
-            Paragraph::new(" h/l parent/child   j/k lanes   +/- zoom   i info   q quit")
+            Paragraph::new(" h/l parent/child  j/k lanes  b branch  ←↑↓→ rotate  +/- zoom  i info  q quit")
                 .style(Style::new().fg(Color::DarkGray)),
             hints,
         );
@@ -222,111 +308,102 @@ impl App<'_> {
         }
     }
 
-    fn draw_graph(&mut self, buf: &mut Buffer, area: Rect) {
-        let (_, _, labels) = ZOOM[self.zoom];
-        let node_w = if labels { 9 } else { 1 }; // "● abc1234" vs "●"
-        // keep selection visible
-        if let Some(cell) = self.sel_cell() {
-            let (sx, sy) = self.world(cell.lane, cell.row);
-            let (w, h) = (area.width as usize, area.height as usize);
-            if w > 0 && h > 0 {
-                self.scroll.0 = self.scroll.0.min(sx).max((sx + node_w).saturating_sub(w));
-                self.scroll.1 = self.scroll.1.min(sy).max((sy + 1).saturating_sub(h));
-            }
-        }
-        let (ox, oy) = self.scroll;
-        let put = |buf: &mut Buffer, wx: usize, wy: usize, sym: &str, style: Style| {
-            if wx < ox || wy < oy {
-                return;
-            }
-            let (x, y) = (wx - ox, wy - oy);
-            if x < area.width as usize && y < area.height as usize {
-                if let Some(c) = buf.cell_mut((area.x + x as u16, area.y + y as u16)) {
-                    c.set_symbol(sym).set_style(style);
-                }
-            }
-        };
+    fn draw_graph(&self, f: &mut ratatui::Frame, area: Rect) {
+        let (radius, labels) = ZOOM[self.zoom];
+        // terminal cells are ~2:1, keep the world roughly isotropic
+        let yr = radius * area.height.max(1) as f64 * 2.0 / area.width.max(1) as f64;
+        let row_h = yr * 2.0 / area.height.max(1) as f64; // one text row in canvas units
 
-        // starfield: fixed pseudo-random world dots, twinkling with the tick
-        for y in oy..oy + area.height as usize {
-            for x in ox..ox + area.width as usize {
-                let h = (x as u64)
-                    .wrapping_mul(2654435761)
-                    .wrapping_add((y as u64).wrapping_mul(0x9E3779B97F4A7C15));
-                let h = h ^ (h >> 13);
-                if h % 29 == 0 {
-                    let bright = (h / 29 + self.tick as u64) % 8 < 2;
-                    put(
-                        buf,
+        let canvas = Canvas::default()
+            .x_bounds([-radius, radius])
+            .y_bounds([-yr, yr])
+            .marker(Marker::Braille)
+            .paint(|ctx| {
+                // starfield drifting opposite the rotation for parallax
+                for i in 0..80u64 {
+                    let h = i
+                        .wrapping_mul(0x9E3779B97F4A7C15)
+                        .wrapping_add(i << 7);
+                    let bx = (h % 997) as f64 / 997.0 * 2.0 - 1.0;
+                    let by = (h / 997 % 991) as f64 / 991.0 * 2.0 - 1.0;
+                    let x = (bx * radius - self.yaw * radius * 0.3).rem_euclid(2.0 * radius) - radius;
+                    let y = (by * yr + self.pitch * yr * 0.3).rem_euclid(2.0 * yr) - yr;
+                    let bright = (h / 31 + self.tick as u64) % 8 < 2;
+                    ctx.print(
                         x,
                         y,
-                        if h % 173 == 0 { "✦" } else { "·" },
-                        Style::new().fg(if bright { Color::Gray } else { Color::DarkGray }),
+                        Line::styled(
+                            if h % 13 == 0 { "✦" } else { "·" },
+                            Style::new().fg(if bright { Color::Gray } else { Color::DarkGray }),
+                        ),
                     );
                 }
-            }
-        }
 
-        // edges child -> parent (drawn under nodes)
-        for cell in &self.cells {
-            let Some(node) = self.nodes.get(&cell.hash) else { continue };
-            let parents: Vec<String> = node
-                .borrow()
-                .parents
-                .borrow()
-                .iter()
-                .filter_map(|w| w.upgrade())
-                .map(|n| n.borrow().hash.clone())
-                .collect();
-            let (cx, cy) = self.world(cell.lane, cell.row);
-            for ph in parents {
-                let Some(&(pl, pr)) = self.pos.get(&ph) else { continue };
-                let (px, py) = self.world(pl, pr);
-                if px >= cx {
-                    continue; // ponytail: skip rightward edges, layout puts parents left (older)
-                }
-                let style = Style::new().fg(lane_color(pl));
-                // run left along the child's lane, turn just right of the parent
-                let turn = px + 1;
-                for x in turn + 1..cx {
-                    put(buf, x, cy, "─", style);
-                }
-                if py == cy {
-                    put(buf, turn, cy, "─", style);
-                } else {
-                    put(buf, turn, cy, if py > cy { "╭" } else { "╰" }, style);
-                    for y in cy.min(py) + 1..cy.max(py) {
-                        put(buf, turn, y, "│", style);
+                // edges child -> parent
+                for cell in &self.cells {
+                    let Some(node) = self.nodes.get(&cell.hash) else { continue };
+                    let (x1, y1, _) = self.project(cell.lane, cell.row, &cell.hash);
+                    for w in node.borrow().parents.borrow().iter() {
+                        let Some(p) = w.upgrade() else { continue };
+                        let ph = p.borrow().hash.clone();
+                        let Some(&(pl, pr)) = self.pos.get(&ph) else { continue };
+                        let (x2, y2, _) = self.project(pl, pr, &ph);
+                        ctx.draw(&Line3 {
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            color: lane_color(pl),
+                        });
                     }
-                    put(buf, turn, py, if py > cy { "╯" } else { "╮" }, style);
                 }
-            }
-        }
+                ctx.layer(); // nodes render above the edge lines
 
-        // nodes
-        for (i, cell) in self.cells.iter().enumerate() {
-            let (x, y) = self.world(cell.lane, cell.row);
-            let selected = i == self.sel;
-            let color = if selected {
-                PULSE[self.tick % PULSE.len()] // pulse through the color cycle
-            } else {
-                lane_color(cell.lane)
-            };
-            put(buf, x, y, if selected { "◉" } else { "●" }, Style::new().fg(color));
-            if !labels {
-                continue; // zoomed out: dots only
-            }
-            let short: String = cell.hash.chars().take(7).collect();
-            let mut label = Style::new().fg(color);
-            if selected {
-                label = label.add_modifier(Modifier::BOLD);
-            } else {
-                label = label.add_modifier(Modifier::DIM);
-            }
-            for (j, ch) in short.chars().enumerate() {
-                put(buf, x + 2 + j, y, &ch.to_string(), label);
-            }
-        }
+                // nodes, painter's order: far ones first so near ones win
+                let mut order: Vec<(usize, &Cell, (f64, f64, f64))> = self
+                    .cells
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (i, c, self.project(c.lane, c.row, &c.hash)))
+                    .collect();
+                order.sort_by(|a, b| b.2 .2.total_cmp(&a.2 .2));
+
+                for (i, cell, (x, y, z)) in order {
+                    let selected = i == self.sel;
+                    let far = z > FOCAL * 0.5;
+                    let color = if selected {
+                        PULSE[self.tick % PULSE.len()] // pulse through the color cycle
+                    } else if far {
+                        Color::DarkGray // depth cue: distant commits fade out
+                    } else {
+                        lane_color(cell.lane)
+                    };
+                    let glyph = if selected { "◉" } else if far { "·" } else { "●" };
+                    let text = if labels && !far {
+                        let short: String = cell.hash.chars().take(7).collect();
+                        format!("{glyph} {short}")
+                    } else {
+                        glyph.to_string()
+                    };
+                    let mut style = Style::new().fg(color);
+                    if selected {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    ctx.print(x, y, Line::styled(text, style));
+
+                    if let Some(name) = self.branch_of(&cell.hash) {
+                        ctx.print(
+                            x,
+                            y - row_h,
+                            Line::styled(
+                                format!("[{name}]"),
+                                Style::new().fg(Color::LightMagenta).add_modifier(Modifier::BOLD),
+                            ),
+                        );
+                    }
+                }
+            });
+        f.render_widget(canvas, area);
     }
 
     fn draw_popup(&self, f: &mut ratatui::Frame) {
@@ -350,7 +427,7 @@ impl App<'_> {
                 .map(|c| c.borrow().short_hash.clone())
                 .collect(),
         );
-        let lines = vec![
+        let mut lines = vec![
             Line::from(format!("hash     {}", n.hash)),
             Line::from(format!("short    {}", n.short_hash)),
             Line::from(format!("date     {} ({})", fmt_epoch(n.timestamp), ago(n.timestamp))),
@@ -358,6 +435,9 @@ impl App<'_> {
             Line::from(format!("parents  {parents}")),
             Line::from(format!("children {children}")),
         ];
+        if let Some(branch) = self.branch_of(&n.hash) {
+            lines.push(Line::from(format!("branch   {branch}")));
+        }
         let area = f.area();
         let w = 72.min(area.width.saturating_sub(4)).max(20);
         let h = (lines.len() as u16 + 2).min(area.height);
@@ -446,5 +526,12 @@ mod tests {
         assert_eq!(nearest_lateral(&cells, 1, 5, -1), Some((0, 5)));
         assert_eq!(nearest_lateral(&cells, 0, 5, 1), Some((1, 4)));
         assert_eq!(nearest_lateral(&cells, 2, 1, 1), None);
+    }
+
+    #[test]
+    fn rot_quarter_turn_maps_x_onto_z() {
+        let (x, z) = rot(1.0, 0.0, std::f64::consts::FRAC_PI_2);
+        assert!(x.abs() < 1e-9);
+        assert!((z - 1.0).abs() < 1e-9);
     }
 }

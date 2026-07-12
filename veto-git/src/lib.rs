@@ -59,3 +59,22 @@ pub fn  get_commits_from_repo(path: String) -> HashMap<String, RawCommit>{
 
     walk_all_branches(&repo)
 }
+
+/// Local branch (name, tip hash) pairs, sorted by name.
+pub fn get_branches(path: String) -> Vec<(String, String)> {
+    let repo = match Repository::open(&path){
+        Ok(repo) => repo,
+        Err(e) => panic!("failed to open: {}", e)
+    };
+
+    let mut out = Vec::new();
+    if let Ok(branches) = repo.branches(Some(BranchType::Local)) {
+        for (branch, _) in branches.flatten() {
+            if let (Ok(Some(name)), Some(tip)) = (branch.name(), branch.get().target()) {
+                out.push((name.to_string(), tip.to_string()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
