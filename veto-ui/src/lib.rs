@@ -27,8 +27,8 @@ use layout::Cell;
 
 type Nodes = HashMap<String, Rc<RefCell<CommitNode>>>;
 
-const LANE_W: usize = 10; // "● abc1234" is 9 chars wide
-const ROW_H: usize = 2;
+/// zoom levels: (column width, lane height, draw hash labels)
+const ZOOM: [(usize, usize, bool); 4] = [(3, 1, false), (6, 2, false), (12, 2, true), (18, 3, true)];
 const LANE_COLORS: [Color; 6] = [
     Color::Cyan,
     Color::Magenta,
@@ -61,10 +61,12 @@ struct App<'a> {
     scroll: (usize, usize),               // (x, y) in world chars
     popup: bool,
     tick: usize,
+    zoom: usize, // index into ZOOM
 }
 
 /// Take over the terminal and run the interactive commit-graph explorer.
-/// j/k walk parent/child, h/l move across lanes, i shows metadata, q quits.
+/// Time flows left (old) to right (new): h/l walk parent/child, j/k move
+/// across lanes, +/- zoom, i shows metadata, q quits.
 pub fn run(nodes: &Nodes) -> io::Result<()> {
     let cells = layout::layout(nodes);
     let pos = cells
@@ -79,6 +81,7 @@ pub fn run(nodes: &Nodes) -> io::Result<()> {
         scroll: (0, 0),
         popup: false,
         tick: 0,
+        zoom: 2,
     };
 
     enable_raw_mode()?;
@@ -97,10 +100,14 @@ pub fn run(nodes: &Nodes) -> io::Result<()> {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('i') => app.popup = !app.popup,
                     _ if app.popup => app.popup = false, // any key closes the popup
-                    KeyCode::Char('j') => app.move_kin(true),
-                    KeyCode::Char('k') => app.move_kin(false),
-                    KeyCode::Char('h') => app.move_lateral(-1),
-                    KeyCode::Char('l') => app.move_lateral(1),
+                    KeyCode::Char('h') => app.move_kin(true), // left = older = parent
+                    KeyCode::Char('l') => app.move_kin(false), // right = newer = child
+                    KeyCode::Char('j') => app.move_lateral(1),
+                    KeyCode::Char('k') => app.move_lateral(-1),
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        app.zoom = (app.zoom + 1).min(ZOOM.len() - 1)
+                    }
+                    KeyCode::Char('-') => app.zoom = app.zoom.saturating_sub(1),
                     _ => {}
                 }
             }
@@ -134,14 +141,21 @@ impl App<'_> {
         }
     }
 
-    /// j (down = first parent) / k (up = first child).
+    /// World coords: oldest commit at x=0, time flows rightward; lanes stack down.
+    fn world(&self, lane: usize, row: usize) -> (usize, usize) {
+        let (cw, lh, _) = ZOOM[self.zoom];
+        let max_row = self.cells.len().saturating_sub(1); // one commit per row
+        ((max_row - row) * cw, lane * lh)
+    }
+
+    /// h (left = first parent, older) / l (right = first child, newer).
     fn move_kin(&mut self, parents: bool) {
         if let Some(h) = self.kin(parents).first().cloned() {
             self.select_hash(&h);
         }
     }
 
-    /// h/l: prefer a parent/child on a lane in that direction (lets you pick
+    /// j/k: prefer a parent/child on a lane in that direction (lets you pick
     /// among merge parents / fork children), else nearest node on the nearest
     /// lane in that direction.
     fn move_lateral(&mut self, dir: isize) {
@@ -198,7 +212,7 @@ impl App<'_> {
         self.draw_graph(f.buffer_mut(), graph);
 
         f.render_widget(
-            Paragraph::new(" j/k parent/child   h/l lanes   i info   q quit")
+            Paragraph::new(" h/l parent/child   j/k lanes   +/- zoom   i info   q quit")
                 .style(Style::new().fg(Color::DarkGray)),
             hints,
         );
@@ -209,12 +223,14 @@ impl App<'_> {
     }
 
     fn draw_graph(&mut self, buf: &mut Buffer, area: Rect) {
+        let (_, _, labels) = ZOOM[self.zoom];
+        let node_w = if labels { 9 } else { 1 }; // "● abc1234" vs "●"
         // keep selection visible
         if let Some(cell) = self.sel_cell() {
-            let (sx, sy) = (cell.lane * LANE_W, cell.row * ROW_H);
+            let (sx, sy) = self.world(cell.lane, cell.row);
             let (w, h) = (area.width as usize, area.height as usize);
             if w > 0 && h > 0 {
-                self.scroll.0 = self.scroll.0.min(sx).max((sx + LANE_W).saturating_sub(w));
+                self.scroll.0 = self.scroll.0.min(sx).max((sx + node_w).saturating_sub(w));
                 self.scroll.1 = self.scroll.1.min(sy).max((sy + 1).saturating_sub(h));
             }
         }
@@ -262,33 +278,34 @@ impl App<'_> {
                 .filter_map(|w| w.upgrade())
                 .map(|n| n.borrow().hash.clone())
                 .collect();
-            let (cx, cy) = (cell.lane * LANE_W, cell.row * ROW_H);
+            let (cx, cy) = self.world(cell.lane, cell.row);
             for ph in parents {
                 let Some(&(pl, pr)) = self.pos.get(&ph) else { continue };
-                let (px, py) = (pl * LANE_W, pr * ROW_H);
-                if py <= cy {
-                    continue; // ponytail: skip upward edges, layout puts parents below
+                let (px, py) = self.world(pl, pr);
+                if px >= cx {
+                    continue; // ponytail: skip rightward edges, layout puts parents left (older)
                 }
                 let style = Style::new().fg(lane_color(pl));
-                let turn = py - 1;
-                for y in cy + 1..turn {
-                    put(buf, cx, y, "│", style);
+                // run left along the child's lane, turn just right of the parent
+                let turn = px + 1;
+                for x in turn + 1..cx {
+                    put(buf, x, cy, "─", style);
                 }
-                if px == cx {
-                    put(buf, cx, turn, "│", style);
+                if py == cy {
+                    put(buf, turn, cy, "─", style);
                 } else {
-                    put(buf, cx, turn, if px > cx { "╰" } else { "╯" }, style);
-                    for x in cx.min(px) + 1..cx.max(px) {
-                        put(buf, x, turn, "─", style);
+                    put(buf, turn, cy, if py > cy { "╭" } else { "╰" }, style);
+                    for y in cy.min(py) + 1..cy.max(py) {
+                        put(buf, turn, y, "│", style);
                     }
-                    put(buf, px, turn, if px > cx { "╮" } else { "╭" }, style);
+                    put(buf, turn, py, if py > cy { "╯" } else { "╮" }, style);
                 }
             }
         }
 
         // nodes
         for (i, cell) in self.cells.iter().enumerate() {
-            let (x, y) = (cell.lane * LANE_W, cell.row * ROW_H);
+            let (x, y) = self.world(cell.lane, cell.row);
             let selected = i == self.sel;
             let color = if selected {
                 PULSE[self.tick % PULSE.len()] // pulse through the color cycle
@@ -296,6 +313,9 @@ impl App<'_> {
                 lane_color(cell.lane)
             };
             put(buf, x, y, if selected { "◉" } else { "●" }, Style::new().fg(color));
+            if !labels {
+                continue; // zoomed out: dots only
+            }
             let short: String = cell.hash.chars().take(7).collect();
             let mut label = Style::new().fg(color);
             if selected {
