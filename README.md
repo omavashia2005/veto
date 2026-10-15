@@ -4,7 +4,7 @@ A git visualization and navigation tool.
 
 ## Demo
 
-See it in action: [export-1792091194726.mp4](export-1792091194726.mp4)
+<video src="export-1792091194726.mp4" controls width="100%"></video>
 
 ## Structure
 
