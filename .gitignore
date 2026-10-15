@@ -2,3 +2,7 @@
 veto-git/target
 veto-graph/target
 veto-ui/target
+/veto-git/.DS_Store
+/veto-graph/.DS_Store
+/veto-ui/.DS_Store
+/.DS_Store
