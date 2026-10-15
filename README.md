@@ -4,7 +4,10 @@ A git visualization and navigation tool.
 
 ## Demo
 
-[Watch demo](demo-optimized.mp4)
+
+https://github.com/user-attachments/assets/8fc62212-48a5-4c09-bf40-f6e7fe7204df
+
+
 
 ## Structure
 
