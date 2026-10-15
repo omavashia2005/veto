@@ -4,7 +4,7 @@ A git visualization and navigation tool.
 
 ## Demo
 
-<video src="demo-optimized.mp4" width="100%" controls></video>
+[Watch demo](demo-optimized.mp4)
 
 ## Structure
 
